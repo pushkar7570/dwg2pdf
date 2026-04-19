@@ -1,0 +1,26 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+python-dotenv==1.0.0
+pydantic==2.5.0
+aiofiles==23.2.1
+httpx==0.25.2
+
+# ── CAD Processing ────────────────────────────────────────────────
+ezdxf==1.1.4
+matplotlib==3.8.2
+
+# ── PDF Processing ────────────────────────────────────────────────
+PyMuPDF==1.23.7
+reportlab==4.0.7
+
+# ── Geometry ─────────────────────────────────────────────────────
+shapely==2.0.2
+numpy==1.26.2
+Pillow==10.1.0
+
+# ── AI / LangChain + Groq ────────────────────────────────────────
+langchain
+langchain-core
+langchain-community
+langchain-groq
