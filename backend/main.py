@@ -9,21 +9,21 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-from pipeline.ingestor import convert_to_pdf
-from pipeline.parser import parse_pdf
-from pipeline.detector import detect_overlaps
+from pipeline.ingestor     import convert_to_pdf
+from pipeline.parser       import parse_pdf
+from pipeline.detector     import detect_overlaps
 from pipeline.reconstructor import rebuild_pdf
-from agent.cad_agent import run_overlap_fixing_agent
-from pipeline.utils import create_job_dir, get_logger, get_file_extension
+from agent.cad_agent       import run_overlap_fixing_agent
+from pipeline.utils        import create_job_dir, get_logger, get_file_extension
 
 load_dotenv()
 logger = get_logger(__name__)
 
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/tmp/cad_fixer")
+UPLOAD_DIR       = os.getenv("UPLOAD_DIR", "/tmp/cad_fixer")
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+SUPPORTED_EXT    = {"dwg", "dxf", "pdf"}
 
-SUPPORTED_EXTENSIONS = {"dwg", "dxf", "pdf"}
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 @asynccontextmanager
@@ -36,9 +36,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="CAD Text Overlap Fixer",
-    description="Agentic AI pipeline for fixing text overlaps in 2D CAD drawings",
-    version="1.0.0",
-    lifespan=lifespan
+    description=(
+        "Agentic AI pipeline that fixes text overlapping drawing "
+        "elements in 2D CAD files (DWG / DXF / PDF)."
+    ),
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -49,209 +52,201 @@ app.add_middleware(
 )
 
 
-def cleanup_job(job_dir: str):
-    """Background task to clean up job files"""
-    try:
-        shutil.rmtree(job_dir, ignore_errors=True)
-    except Exception as e:
-        logger.warning(f"Cleanup failed for {job_dir}: {e}")
+def _cleanup(job_dir: str):
+    """Background task: remove temp job directory."""
+    shutil.rmtree(job_dir, ignore_errors=True)
 
 
 @app.get("/", tags=["Health"])
 def root():
     return {
-        "service": "CAD Text Overlap Fixer",
-        "status": "running",
-        "version": "1.0.0",
+        "service" : "CAD Text Overlap Fixer",
+        "version" : "2.0.0",
+        "status"  : "running",
         "endpoints": {
-            "process": "POST /process",
-            "health": "GET /health",
-            "docs": "GET /docs"
-        }
+            "process"    : "POST /process",
+            "detect_only": "POST /detect-only",
+            "health"     : "GET  /health",
+            "docs"       : "GET  /docs",
+        },
     }
 
 
 @app.get("/health", tags=["Health"])
 def health():
-    """Health check endpoint"""
-    llm_provider = os.getenv("LLM_PROVIDER", "gemini")
-    has_gemini = bool(os.getenv("GEMINI_API_KEY"))
-    has_groq = bool(os.getenv("GROQ_API_KEY"))
-
+    from pipeline.ingestor import _detect_dwg_engine
+    engines = _detect_dwg_engine()
     return {
-        "status": "healthy",
-        "llm_provider": llm_provider,
-        "gemini_configured": has_gemini,
-        "groq_configured": has_groq,
-        "upload_dir": UPLOAD_DIR
+        "status"          : "healthy",
+        "llm_provider"    : os.getenv("LLM_PROVIDER", "groq"),
+        "groq_configured" : bool(os.getenv("GROQ_API_KEY")),
+        "dwg_engines"     : list(engines.keys()) if engines else ["ezdxf_fallback"],
+        "upload_dir"      : UPLOAD_DIR,
     }
 
 
 @app.post("/process", tags=["Processing"])
-async def process_cad_file(
+async def process_file(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(..., description="DWG, DXF, or PDF file to process")
+    file: UploadFile = File(...),
 ):
     """
-    Main processing endpoint.
-    
-    Pipeline:
-    1. Validate and save uploaded file
-    2. Convert DWG/DXF → PDF (if needed)
-    3. Parse PDF elements
-    4. Detect text-drawing overlaps
-    5. If overlaps: run AI agent to reposition text
-    6. Rebuild corrected PDF
-    7. Return result
+    Full pipeline: ingest → parse → detect → AI fix → rebuild PDF.
+
+    Returns corrected PDF. If no overlaps detected, returns
+    converted PDF as-is without any AI processing.
     """
-    # ── Validate file ────────────────────────────────────────────────────────
     ext = get_file_extension(file.filename or "")
-    if ext not in SUPPORTED_EXTENSIONS:
+    if ext not in SUPPORTED_EXT:
         raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type '.{ext}'. Supported: {SUPPORTED_EXTENSIONS}"
+            400,
+            f"Unsupported file type .{ext}. "
+            f"Supported: {SUPPORTED_EXT}"
         )
 
-    # ── Create job directory ─────────────────────────────────────────────────
     job_id, job_dir = create_job_dir(UPLOAD_DIR)
-    logger.info(f"Job {job_id}: Processing '{file.filename}'")
+    logger.info(f"Job {job_id}: '{file.filename}'")
 
     try:
-        # ── Save uploaded file ───────────────────────────────────────────────
+        # Save upload
         input_path = os.path.join(job_dir, f"input.{ext}")
-        content = await file.read()
+        content    = await file.read()
 
         if len(content) > MAX_FILE_SIZE_MB * 1024 * 1024:
-            raise HTTPException(400, f"File too large. Max {MAX_FILE_SIZE_MB}MB")
+            raise HTTPException(
+                400, f"File exceeds {MAX_FILE_SIZE_MB}MB limit."
+            )
 
         with open(input_path, "wb") as f:
             f.write(content)
 
-        logger.info(f"Job {job_id}: Saved {len(content)/1024:.1f}KB")
+        logger.info(f"Job {job_id}: Saved {len(content)//1024}KB")
 
-        # ── Stage 1: Convert to PDF ──────────────────────────────────────────
+        # Stage 1: Convert to PDF
         pdf_path = os.path.join(job_dir, "drawing.pdf")
-        logger.info(f"Job {job_id}: Stage 1 - Converting to PDF")
+        logger.info(f"Job {job_id}: Stage 1 — Convert to PDF")
         pdf_path = convert_to_pdf(input_path, pdf_path)
 
-        # ── Stage 2: Parse PDF ───────────────────────────────────────────────
-        logger.info(f"Job {job_id}: Stage 2 - Parsing PDF")
-        parsed_doc = parse_pdf(pdf_path)
-
+        # Stage 2: Parse
+        logger.info(f"Job {job_id}: Stage 2 — Parse PDF")
+        parsed = parse_pdf(pdf_path)
         logger.info(
-            f"Job {job_id}: Parsed {len(parsed_doc.all_text_blocks)} text blocks, "
-            f"{len(parsed_doc.all_drawing_elements)} drawing elements"
+            f"Job {job_id}: "
+            f"{len(parsed.all_text_blocks)} text blocks, "
+            f"{len(parsed.all_drawing_elements)} drawing elements"
         )
 
-        # ── Stage 3: Detect Overlaps ─────────────────────────────────────────
-        logger.info(f"Job {job_id}: Stage 3 - Detecting overlaps")
-        detection = detect_overlaps(parsed_doc)
+        # Stage 3: Detect overlaps
+        logger.info(f"Job {job_id}: Stage 3 — Detect overlaps")
+        detection = detect_overlaps(parsed)
 
-        # ── Early Exit: No Overlaps ──────────────────────────────────────────
+        # Early exit if no overlaps
         if not detection.has_overlaps:
-            logger.info(f"Job {job_id}: No overlaps. Returning converted PDF directly.")
-            background_tasks.add_task(cleanup_job, job_dir)
+            logger.info(f"Job {job_id}: No overlaps. Returning PDF directly.")
+            background_tasks.add_task(_cleanup, job_dir)
             return FileResponse(
                 path=pdf_path,
-                filename=f"clean_{os.path.splitext(file.filename)[0]}.pdf",
+                filename=f"clean_{_stem(file.filename)}.pdf",
                 media_type="application/pdf",
                 headers={
-                    "X-Job-ID": job_id,
-                    "X-Overlap-Fixed": "false",
-                    "X-Status": "no_overlap_found",
-                    "X-Text-Blocks": str(len(parsed_doc.all_text_blocks)),
-                    "X-Drawing-Elements": str(len(parsed_doc.all_drawing_elements))
-                }
+                    "X-Job-ID"        : job_id,
+                    "X-Overlap-Fixed" : "false",
+                    "X-Status"        : "no_overlap_found",
+                    "X-Text-Blocks"   : str(len(parsed.all_text_blocks)),
+                },
             )
 
-        # ── Stage 4: AI Agent Repositioning ─────────────────────────────────
+        # Stage 4: AI agent fix
         logger.info(
-            f"Job {job_id}: Stage 4 - AI Agent fixing "
-            f"{detection.total_conflicts} overlaps"
+            f"Job {job_id}: Stage 4 — AI fixing "
+            f"{detection.total_conflicts} overlap(s)"
         )
-        repositioned = run_overlap_fixing_agent(detection, parsed_doc)
+        repositioned = run_overlap_fixing_agent(detection, parsed)
 
         if not repositioned:
-            logger.warning(f"Job {job_id}: Agent returned no fixes, using original PDF")
+            logger.warning(f"Job {job_id}: Agent produced no fixes.")
+            background_tasks.add_task(_cleanup, job_dir)
             return FileResponse(
                 path=pdf_path,
-                filename=f"output_{os.path.splitext(file.filename)[0]}.pdf",
+                filename=f"output_{_stem(file.filename)}.pdf",
                 media_type="application/pdf",
                 headers={
-                    "X-Job-ID": job_id,
-                    "X-Overlap-Fixed": "false",
-                    "X-Status": "agent_no_fixes",
-                    "X-Overlaps-Detected": str(detection.total_conflicts)
-                }
+                    "X-Job-ID"           : job_id,
+                    "X-Status"           : "agent_no_fixes",
+                    "X-Overlaps-Detected": str(detection.total_conflicts),
+                },
             )
 
-        # ── Stage 5: Rebuild PDF ─────────────────────────────────────────────
-        logger.info(f"Job {job_id}: Stage 5 - Rebuilding PDF")
+        # Stage 5: Rebuild PDF
+        logger.info(f"Job {job_id}: Stage 5 — Rebuilding PDF")
         output_path = os.path.join(job_dir, "corrected.pdf")
         rebuild_pdf(pdf_path, repositioned, output_path)
 
-        logger.info(f"Job {job_id}: Complete! {len(repositioned)} text blocks moved.")
+        logger.info(
+            f"Job {job_id}: Complete — "
+            f"{len(repositioned)} text block(s) repositioned."
+        )
 
-        background_tasks.add_task(cleanup_job, job_dir)
-
+        background_tasks.add_task(_cleanup, job_dir)
         return FileResponse(
             path=output_path,
-            filename=f"corrected_{os.path.splitext(file.filename)[0]}.pdf",
+            filename=f"corrected_{_stem(file.filename)}.pdf",
             media_type="application/pdf",
             headers={
-                "X-Job-ID": job_id,
-                "X-Overlap-Fixed": "true",
-                "X-Status": "overlaps_fixed",
+                "X-Job-ID"        : job_id,
+                "X-Overlap-Fixed" : "true",
+                "X-Status"        : "overlaps_fixed",
                 "X-Overlaps-Fixed": str(len(repositioned)),
-                "X-Total-Text-Blocks": str(len(parsed_doc.all_text_blocks))
-            }
+                "X-Text-Blocks"   : str(len(parsed.all_text_blocks)),
+            },
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Job {job_id}: Pipeline failed: {str(e)}", exc_info=True)
-        cleanup_job(job_dir)
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        _cleanup(job_dir)
+        logger.error(f"Job {job_id}: Pipeline failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Processing failed: {e}")
 
 
 @app.post("/detect-only", tags=["Processing"])
-async def detect_only(
-    file: UploadFile = File(..., description="File to analyze for overlaps")
-):
+async def detect_only(file: UploadFile = File(...)):
     """
-    Only detect overlaps without fixing them.
-    Returns JSON report of all conflicts found.
+    Detect overlaps without fixing them.
+    Returns JSON analysis report including zone information.
     """
     ext = get_file_extension(file.filename or "")
-    if ext not in SUPPORTED_EXTENSIONS:
+    if ext not in SUPPORTED_EXT:
         raise HTTPException(400, f"Unsupported file type: .{ext}")
 
     job_id, job_dir = create_job_dir(UPLOAD_DIR)
 
     try:
         input_path = os.path.join(job_dir, f"input.{ext}")
-        content = await file.read()
+        content    = await file.read()
         with open(input_path, "wb") as f:
             f.write(content)
 
-        pdf_path = os.path.join(job_dir, "drawing.pdf")
-        pdf_path = convert_to_pdf(input_path, pdf_path)
-        parsed_doc = parse_pdf(pdf_path)
-        detection = detect_overlaps(parsed_doc)
+        pdf_path  = os.path.join(job_dir, "drawing.pdf")
+        pdf_path  = convert_to_pdf(input_path, pdf_path)
+        parsed    = parse_pdf(pdf_path)
+        detection = detect_overlaps(parsed)
 
-        return JSONResponse(
-            content={
-                "job_id": job_id,
-                "filename": file.filename,
-                "pages": parsed_doc.page_count,
-                "total_text_blocks": len(parsed_doc.all_text_blocks),
-                "total_drawing_elements": len(parsed_doc.all_drawing_elements),
-                "detection": detection.to_dict()
-            }
-        )
+        return JSONResponse(content={
+            "job_id"                : job_id,
+            "filename"              : file.filename,
+            "pages"                 : parsed.page_count,
+            "total_text_blocks"     : len(parsed.all_text_blocks),
+            "total_drawing_elements": len(parsed.all_drawing_elements),
+            "detection"             : detection.to_dict(),
+        })
 
     except Exception as e:
-        raise HTTPException(500, f"Detection failed: {str(e)}")
+        raise HTTPException(500, f"Detection failed: {e}")
     finally:
-        cleanup_job(job_dir)
+        _cleanup(job_dir)
+
+
+def _stem(filename: str) -> str:
+    """Get filename without extension."""
+    return os.path.splitext(filename or "output")[0]

@@ -1,8 +1,9 @@
 # backend/pipeline/parser.py
 
-import fitz  # PyMuPDF
+import math
+import fitz
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional, Tuple
 from .utils import get_logger
 
 logger = get_logger(__name__)
@@ -10,73 +11,76 @@ logger = get_logger(__name__)
 
 @dataclass
 class TextBlock:
-    """Represents a text element extracted from PDF"""
-    text: str
-    bbox: tuple
-    page_no: int
-    font_size: float = 8.0
-    font_name: str = "helv"
-    color: tuple = (0, 0, 0)
-    block_id: str = ""
+    text     : str
+    bbox     : tuple
+    page_no  : int
+    font_size: float          = 8.0
+    font_name: str            = "helv"
+    color    : tuple          = (0, 0, 0)
+    rotation : float          = 0.0
+    block_id : str            = ""
 
     def __post_init__(self):
         if not self.block_id:
-            self.block_id = f"p{self.page_no}_{int(self.bbox[0])}_{int(self.bbox[1])}"
+            self.block_id = (
+                f"p{self.page_no}_"
+                f"{int(self.bbox[0])}_"
+                f"{int(self.bbox[1])}"
+            )
 
     @property
-    def width(self) -> float:
-        return self.bbox[2] - self.bbox[0]
+    def width(self)  -> float:
+        return max(0.0, self.bbox[2] - self.bbox[0])
 
     @property
     def height(self) -> float:
-        return self.bbox[3] - self.bbox[1]
+        return max(0.0, self.bbox[3] - self.bbox[1])
 
     @property
-    def center(self) -> tuple:
+    def center(self) -> Tuple[float, float]:
         return (
-            (self.bbox[0] + self.bbox[2]) / 2,
-            (self.bbox[1] + self.bbox[3]) / 2
+            (self.bbox[0] + self.bbox[2]) / 2.0,
+            (self.bbox[1] + self.bbox[3]) / 2.0,
         )
 
 
 @dataclass
 class DrawingElement:
-    """Represents a drawing path/shape extracted from PDF"""
     element_type: str
-    bbox: tuple
-    page_no: int
+    bbox        : tuple
+    page_no     : int
+    is_filled   : bool            = False
+    fill_color  : Optional[tuple] = None
 
     @property
     def area(self) -> float:
         return (
-            max(0, self.bbox[2] - self.bbox[0]) *
-            max(0, self.bbox[3] - self.bbox[1])
+            max(0.0, self.bbox[2] - self.bbox[0]) *
+            max(0.0, self.bbox[3] - self.bbox[1])
         )
 
 
 @dataclass
 class ParsedPage:
-    """All elements from a single PDF page"""
-    page_no: int
-    width: float
-    height: float
-    text_blocks: List[TextBlock] = field(default_factory=list)
+    page_no         : int
+    width           : float
+    height          : float
+    text_blocks     : List[TextBlock]      = field(default_factory=list)
     drawing_elements: List[DrawingElement] = field(default_factory=list)
 
 
 @dataclass
 class ParsedDocument:
-    """Complete parsed PDF document"""
     pdf_path: str
-    pages: List[ParsedPage] = field(default_factory=list)
+    pages   : List[ParsedPage] = field(default_factory=list)
 
     @property
     def all_text_blocks(self) -> List[TextBlock]:
-        return [t for page in self.pages for t in page.text_blocks]
+        return [t for p in self.pages for t in p.text_blocks]
 
     @property
     def all_drawing_elements(self) -> List[DrawingElement]:
-        return [d for page in self.pages for d in page.drawing_elements]
+        return [d for p in self.pages for d in p.drawing_elements]
 
     @property
     def page_count(self) -> int:
@@ -85,8 +89,17 @@ class ParsedDocument:
 
 def parse_pdf(pdf_path: str) -> ParsedDocument:
     """
-    Parse PDF and extract all text blocks and drawing elements
-    with their exact bounding box coordinates.
+    Extract text blocks and drawing elements from PDF.
+
+    Handles:
+    - Real CAD PDFs (from ODA, AutoCAD export)
+    - SVG-rendered PDFs (from svglib)
+    - Complex multi-layer drawings
+
+    Safety filters:
+    - Skips zero-area text spans
+    - Skips oversized bboxes (garbage extractions)
+    - Clips bboxes to page bounds
     """
     logger.info(f"Parsing PDF: {pdf_path}")
     doc_data = ParsedDocument(pdf_path=pdf_path)
@@ -97,91 +110,135 @@ def parse_pdf(pdf_path: str) -> ParsedDocument:
         for page_no in range(len(pdf_doc)):
             page = pdf_doc[page_no]
             rect = page.rect
+            pw   = rect.width
+            ph   = rect.height
 
             parsed_page = ParsedPage(
                 page_no=page_no,
-                width=rect.width,
-                height=rect.height
+                width=pw,
+                height=ph,
             )
 
-            # ── Extract Text Blocks ──────────────────────────────
-            text_dict = page.get_text(
-                "dict",
-                flags=fitz.TEXT_PRESERVE_WHITESPACE
-            )
-
-            for block in text_dict.get("blocks", []):
-                if block.get("type") != 0:
-                    continue
-
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        raw_text = span.get("text", "").strip()
-                        if not raw_text:
-                            continue
-
-                        bbox = tuple(span.get("bbox", (0, 0, 0, 0)))
-
-                        # Skip zero-area text
-                        if bbox[2] - bbox[0] < 1 or bbox[3] - bbox[1] < 1:
-                            continue
-
-                        # Decode color
-                        raw_color = span.get("color", 0)
-                        if isinstance(raw_color, int):
-                            r = ((raw_color >> 16) & 0xFF) / 255.0
-                            g = ((raw_color >> 8)  & 0xFF) / 255.0
-                            b = ( raw_color        & 0xFF) / 255.0
-                            color = (r, g, b)
-                        else:
-                            color = (0.0, 0.0, 0.0)
-
-                        text_block = TextBlock(
-                            text=raw_text,
-                            bbox=bbox,
-                            page_no=page_no,
-                            font_size=span.get("size", 8.0),
-                            font_name=span.get("font", "helv"),
-                            color=color
-                        )
-                        parsed_page.text_blocks.append(text_block)
-
-            # ── Extract Drawing Elements ─────────────────────────
-            paths = page.get_drawings()
-            for path in paths:
-                path_rect = path.get("rect")
-                if not path_rect:
-                    continue
-
-                bbox = (
-                    path_rect.x0,
-                    path_rect.y0,
-                    path_rect.x1,
-                    path_rect.y1
+            # ── Extract text ─────────────────────────────────────
+            try:
+                text_dict = page.get_text(
+                    "dict",
+                    flags=fitz.TEXT_PRESERVE_WHITESPACE,
                 )
 
-                # Skip tiny noise elements
-                if (bbox[2] - bbox[0]) < 2 and (bbox[3] - bbox[1]) < 2:
-                    continue
+                for block in text_dict.get("blocks", []):
+                    if block.get("type") != 0:
+                        continue
 
-                drawing_elem = DrawingElement(
-                    element_type=str(path.get("type", "path")),
-                    bbox=bbox,
-                    page_no=page_no
+                    for line in block.get("lines", []):
+                        direction = line.get("dir", (1, 0))
+                        try:
+                            rotation = math.degrees(
+                                math.atan2(direction[1], direction[0])
+                            )
+                        except Exception:
+                            rotation = 0.0
+
+                        for span in line.get("spans", []):
+                            raw = span.get("text", "").strip()
+                            if not raw:
+                                continue
+
+                            bbox = tuple(span.get("bbox", (0, 0, 0, 0)))
+                            bw   = bbox[2] - bbox[0]
+                            bh   = bbox[3] - bbox[1]
+
+                            # Skip zero / negative size
+                            if bw < 0.5 or bh < 0.5:
+                                continue
+
+                            # Skip oversized (corrupt extractions)
+                            if bw > pw * 0.5 or bh > ph * 0.5:
+                                logger.debug(
+                                    f"Skipped oversized bbox "
+                                    f"'{raw[:20]}': "
+                                    f"{bw:.0f}x{bh:.0f}"
+                                )
+                                continue
+
+                            # Clip to page with tolerance
+                            tol  = 10.0
+                            bbox = (
+                                max(bbox[0], -tol),
+                                max(bbox[1], -tol),
+                                min(bbox[2], pw + tol),
+                                min(bbox[3], ph + tol),
+                            )
+
+                            # Decode color
+                            raw_color = span.get("color", 0)
+                            if isinstance(raw_color, int):
+                                color = (
+                                    ((raw_color >> 16) & 0xFF) / 255.0,
+                                    ((raw_color >>  8) & 0xFF) / 255.0,
+                                    ( raw_color        & 0xFF) / 255.0,
+                                )
+                            else:
+                                color = (0.0, 0.0, 0.0)
+
+                            parsed_page.text_blocks.append(TextBlock(
+                                text=raw,
+                                bbox=bbox,
+                                page_no=page_no,
+                                font_size=float(span.get("size", 8.0)),
+                                font_name=str(span.get("font", "helv")),
+                                color=color,
+                                rotation=rotation,
+                            ))
+
+            except Exception as e:
+                logger.warning(
+                    f"Text extraction error page {page_no}: {e}"
                 )
-                parsed_page.drawing_elements.append(drawing_elem)
+
+            # ── Extract drawings ─────────────────────────────────
+            try:
+                for path in page.get_drawings():
+                    r = path.get("rect")
+                    if not r:
+                        continue
+
+                    bbox = (r.x0, r.y0, r.x1, r.y1)
+
+                    if (bbox[2]-bbox[0]) < 0.5 and (bbox[3]-bbox[1]) < 0.5:
+                        continue
+
+                    fill      = path.get("fill", None)
+                    is_filled = (
+                        fill is not None
+                        and fill != (1, 1, 1)
+                        and fill != 1
+                    )
+
+                    parsed_page.drawing_elements.append(DrawingElement(
+                        element_type=str(path.get("type", "path")),
+                        bbox=bbox,
+                        page_no=page_no,
+                        is_filled=is_filled,
+                        fill_color=tuple(fill) if is_filled and fill else None,
+                    ))
+
+            except Exception as e:
+                logger.warning(
+                    f"Drawing extraction error page {page_no}: {e}"
+                )
 
             logger.info(
                 f"  Page {page_no}: "
-                f"{len(parsed_page.text_blocks)} text blocks, "
-                f"{len(parsed_page.drawing_elements)} drawing elements"
+                f"{len(parsed_page.text_blocks)} text, "
+                f"{len(parsed_page.drawing_elements)} drawings "
+                f"({sum(1 for d in parsed_page.drawing_elements if d.is_filled)} filled)"
             )
             doc_data.pages.append(parsed_page)
 
         pdf_doc.close()
 
     except Exception as e:
-        logger.error(f"PDF parsing failed: {str(e)}")
-        raise RuntimeError(f"Failed to parse PDF: {str(e)}")
+        raise RuntimeError(f"PDF parse failed: {e}")
 
     return doc_data
