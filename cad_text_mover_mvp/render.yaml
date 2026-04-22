@@ -3,6 +3,7 @@ services:
     name: cad-text-mover-mvp
     runtime: docker
     plan: free
+    rootDir: cad_text_mover_mvp
     autoDeployTrigger: off
     healthCheckPath: /healthz
     dockerfilePath: ./Dockerfile
