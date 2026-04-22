@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CAD Text Mover</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <form id="upload-form" class="panel" autocomplete="off">
+      <label class="file-picker">
+        <input id="file-input" type="file" accept=".dwg,.dxf,.dwf" required>
+        <span id="file-label">Select DWG / DXF / DWF</span>
+      </label>
+
+      <div class="actions">
+        <button id="upload-button" type="submit">Upload</button>
+      </div>
+
+      <section id="job-panel" class="job hidden" aria-live="polite">
+        <div class="job-row">
+          <span id="job-status" class="status">Idle</span>
+          <span id="job-file" class="filename"></span>
+        </div>
+
+        <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+
+        <div id="job-message" class="message"></div>
+
+        <div id="download-actions" class="download-actions hidden">
+          <a id="download-link" class="button-link" href="#" download>Download PDF</a>
+        </div>
+      </section>
+    </form>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

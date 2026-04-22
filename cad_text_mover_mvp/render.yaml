@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: cad-text-mover-mvp
+    runtime: docker
+    plan: free
+    autoDeployTrigger: off
+    healthCheckPath: /healthz
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: API_PREFIX
+        value: /v1
+      - key: STORAGE_ROOT
+        value: /tmp/cad-text-mover/storage
+      - key: SQLITE_PATH
+        value: /tmp/cad-text-mover/jobs.sqlite3
+      - key: MAX_UPLOAD_SIZE_MB
+        value: 50
+      - key: CLOUDCONVERT_FAILOVER_ENABLED
+        value: true
+      - key: CLOUDCONVERT_KEY_COOLDOWN_SECONDS
+        value: 900
+      - key: WORKER_POLL_INTERVAL_SECONDS
+        value: 2.0
+      - key: CLOUDCONVERT_POLL_INTERVAL_SECONDS
+        value: 2.0
+      - key: CLOUDCONVERT_TIMEOUT_SECONDS
+        value: 120.0
+      - key: TESSERACT_CMD
+        value: /usr/bin/tesseract
+      - key: CLOUDCONVERT_API_KEYS
+        sync: false
