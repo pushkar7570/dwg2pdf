@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 import fitz
@@ -11,7 +10,7 @@ from app.pdf.geometry import PageGeometryExtractor
 from app.pdf.placement import MarginPacker
 from app.pdf.scoring import TextDecisionEngine
 from app.pdf.text_extraction import TextExtractor
-from app.pdf.types import MoveRecord, PageAudit, Placement, ProcessingAudit, RectBox, TextItem
+from app.pdf.types import MoveRecord, PageAudit, Placement, ProcessingAudit, RectBox
 
 
 class CadPdfProcessor:
@@ -69,11 +68,53 @@ class CadPdfProcessor:
                 margin_strips={name: rect.to_dict() for name, rect in geometry.margin_strips.items()},
             )
             if used_ocr:
-                page_audit.review_flags.append("ocr_fallback_used")
+                page_audit.review_flags.extend([
+                    "ocr_fallback_used",
+                    "page_left_unmodified_due_to_ocr",
+                ])
             if not geometry.margin_strips:
                 page_audit.review_flags.append("no_margin_strip_detected")
 
-            move_candidates = [item for item in annotated_items if item.classification == "move"]
+            move_candidates = []
+            for item in annotated_items:
+                if item.classification != "move":
+                    continue
+
+                if used_ocr or item.extraction_method != "native":
+                    item.classification = "review"
+                    item.review_flags.append("ocr_move_disabled_mvp")
+                    page_audit.move_records.append(
+                        MoveRecord(
+                            page_number=page_index,
+                            text_item=item,
+                            placement=None,
+                            final_confidence=self.decision_engine.final_confidence(item, None),
+                            moved=False,
+                            redaction_strategy="none",
+                        )
+                    )
+                    continue
+
+                move_candidates.append(item)
+
+            total_items = max(1, len(annotated_items))
+            if len(move_candidates) >= 8 and (len(move_candidates) > 15 or (len(move_candidates) / total_items) > 0.20):
+                page_audit.review_flags.append("page_rewrite_skipped_too_many_move_candidates")
+                for item in move_candidates:
+                    item.classification = "review"
+                    item.review_flags.append("page_guardrail_triggered")
+                    page_audit.move_records.append(
+                        MoveRecord(
+                            page_number=page_index,
+                            text_item=item,
+                            placement=None,
+                            final_confidence=self.decision_engine.final_confidence(item, None),
+                            moved=False,
+                            redaction_strategy="none",
+                        )
+                    )
+                move_candidates = []
+
             blockers = [
                 item.bbox.expanded(1.0)
                 for item in annotated_items
@@ -104,10 +145,23 @@ class CadPdfProcessor:
                     continue
 
                 placements[item.item_id] = placement
-                blockers.append(placement.target_bbox.expanded(2.0))
                 final_confidence = self.decision_engine.final_confidence(item, placement)
-                if final_confidence < 0.65:
-                    item.review_flags.append("manual_review_recommended")
+                if final_confidence < 0.70 or item.overlap_score < 0.60:
+                    item.classification = "review"
+                    item.review_flags.append("move_below_conservative_threshold")
+                    page_audit.move_records.append(
+                        MoveRecord(
+                            page_number=page_index,
+                            text_item=item,
+                            placement=placement,
+                            final_confidence=final_confidence,
+                            moved=False,
+                            redaction_strategy="none",
+                        )
+                    )
+                    continue
+
+                blockers.append(placement.target_bbox.expanded(2.0))
                 page_audit.move_records.append(
                     MoveRecord(
                         page_number=page_index,
@@ -115,11 +169,7 @@ class CadPdfProcessor:
                         placement=placement,
                         final_confidence=final_confidence,
                         moved=True,
-                        redaction_strategy=(
-                            "native_redaction"
-                            if item.extraction_method == "native"
-                            else "visual_whiteout"
-                        ),
+                        redaction_strategy="native_redaction",
                     )
                 )
                 moved_total += 1
@@ -128,7 +178,7 @@ class CadPdfProcessor:
             review_item_ids.update(
                 record.text_item.item_id
                 for record in page_audit.move_records
-                if "manual_review_recommended" in record.text_item.review_flags
+                if not record.moved or "manual_review_recommended" in record.text_item.review_flags
             )
             review_total += len(review_item_ids)
 
@@ -155,8 +205,11 @@ class CadPdfProcessor:
         return audit
 
     def _apply_page_updates(self, page: fitz.Page, move_records: list[MoveRecord]) -> None:
-        native_moves = [record for record in move_records if record.moved and record.text_item.extraction_method == "native"]
-        ocr_moves = [record for record in move_records if record.moved and record.text_item.extraction_method == "ocr"]
+        native_moves = [
+            record
+            for record in move_records
+            if record.moved and record.text_item.extraction_method == "native"
+        ]
 
         for record in native_moves:
             page.add_redact_annot(
@@ -172,24 +225,20 @@ class CadPdfProcessor:
                 text=fitz.PDF_REDACT_TEXT_REMOVE,
             )
 
-        for record in ocr_moves:
-            whiteout = record.text_item.bbox.expanded(0.75).to_fitz()
-            page.draw_rect(whiteout, color=None, fill=(1, 1, 1), width=0, overlay=True)
-
-        for record in [r for r in move_records if r.moved and r.placement is not None]:
-            self._draw_callout(page, record)
+        for record in native_moves:
+            if record.placement is not None:
+                self._draw_callout(page, record)
 
     def _draw_callout(self, page: fitz.Page, record: MoveRecord) -> None:
         assert record.placement is not None
         target = record.placement.target_bbox.to_fitz()
-        page.draw_rect(target, color=(0, 0, 0), fill=(1, 1, 1), width=0.6, overlay=True)
+        page.draw_rect(target, color=(0, 0, 0), fill=(1, 1, 1), width=0.3, overlay=True)
         self._insert_text(
             page,
             target,
             record.placement.render_text,
             record.placement.render_font_size,
         )
-        self._draw_leader(page, record.text_item.bbox, record.placement.target_bbox)
 
     def _insert_text(self, page: fitz.Page, target: fitz.Rect, text: str, font_size: float) -> None:
         inner = fitz.Rect(target.x0 + 1.5, target.y0 + 1.5, target.x1 - 1.5, target.y1 - 1.5)
@@ -217,17 +266,3 @@ class CadPdfProcessor:
             align=fitz.TEXT_ALIGN_LEFT,
             overlay=True,
         )
-
-    def _draw_leader(self, page: fitz.Page, source: RectBox, target: RectBox) -> None:
-        start = source.center
-        end = self._nearest_point_on_rect(target, start)
-        page.draw_line(start, end, color=(0, 0, 0), width=0.5, overlay=True)
-
-    def _nearest_point_on_rect(self, rect: RectBox, source_point: tuple[float, float]) -> tuple[float, float]:
-        x, y = source_point
-        cx, cy = rect.center
-        dx = x - cx
-        dy = y - cy
-        if abs(dx) > abs(dy):
-            return (rect.x0 if dx > 0 else rect.x1, min(max(y, rect.y0), rect.y1))
-        return (min(max(x, rect.x0), rect.x1), rect.y0 if dy > 0 else rect.y1)
