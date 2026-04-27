@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import Settings, get_settings
 from app.db import JobRecord, JobRepository
@@ -19,6 +22,7 @@ from app.storage import StorageManager
 from app.worker import JobWorker
 
 
+logger = logging.getLogger(__name__)
 ALLOWED_EXTENSIONS = {".dwg", ".dxf", ".dwf"}
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -46,6 +50,29 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="CAD Text Mover MVP", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.middleware("http")
+async def add_no_store_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled application error", exc_info=exc)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 @app.get("/")

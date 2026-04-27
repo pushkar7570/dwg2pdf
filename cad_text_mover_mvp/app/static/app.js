@@ -1,4 +1,5 @@
 const STATUS_PROGRESS = {
+  idle: 0,
   queued: 5,
   processing: 20,
   converting: 55,
@@ -10,6 +11,7 @@ const STATUS_PROGRESS = {
 const STORAGE_KEY = "cad-text-mover-active-job";
 const DEFAULT_OPTIONS = { all_layouts: true };
 const POLL_INTERVAL_MS = 2000;
+const MAX_TRANSIENT_POLL_ERRORS = 8;
 
 const form = document.getElementById("upload-form");
 const fileInput = document.getElementById("file-input");
@@ -27,6 +29,7 @@ const downloadLink = document.getElementById("download-link");
 let pollTimer = null;
 let activeJobId = null;
 let activeFileName = "";
+let transientPollErrors = 0;
 
 function setStatus(status, message = "") {
   const progress = STATUS_PROGRESS[status] ?? 0;
@@ -39,6 +42,12 @@ function setStatus(status, message = "") {
 
   form.classList.toggle("is-complete", status === "completed");
   form.classList.toggle("is-failed", status === "failed");
+}
+
+function resetIdleState() {
+  setStatus("idle", "");
+  jobStatus.textContent = "Idle";
+  jobMessage.textContent = "";
 }
 
 function setBusy(isBusy) {
@@ -68,6 +77,7 @@ function saveActiveJob(jobId, fileName) {
 
 function clearActiveJob() {
   activeJobId = null;
+  activeFileName = "";
   localStorage.removeItem(STORAGE_KEY);
 }
 
@@ -88,46 +98,96 @@ function stopPolling() {
   }
 }
 
-function schedulePoll() {
+function schedulePoll(delay = POLL_INTERVAL_MS) {
   stopPolling();
   pollTimer = setTimeout(() => {
     if (activeJobId) {
       pollJob(activeJobId).catch((error) => {
-        setStatus("failed", error.message || "Polling failed");
+        handlePollError(error);
       });
     }
-  }, POLL_INTERVAL_MS);
+  }, delay);
+}
+
+async function parseJsonResponse(response) {
+  const rawText = await response.text();
+
+  if (!rawText || !rawText.trim()) {
+    const err = new Error("Empty response from server");
+    err.isTransient = true;
+    throw err;
+  }
+
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    const err = new Error(response.ok ? "Server returned an invalid response" : "Server returned a non-JSON error response");
+    err.isTransient = response.status >= 500 || response.status === 0;
+    throw err;
+  }
+}
+
+async function fetchJson(url, options = {}) {
+  let response;
+  try {
+    response = await fetch(url, {
+      cache: "no-store",
+      ...options,
+      headers: {
+        Accept: "application/json",
+        ...(options.headers || {}),
+      },
+    });
+  } catch {
+    const err = new Error("Network connection interrupted");
+    err.isTransient = true;
+    throw err;
+  }
+
+  const payload = await parseJsonResponse(response);
+
+  if (!response.ok) {
+    const detail = typeof payload?.detail === "string" ? payload.detail : `Request failed (${response.status})`;
+    const err = new Error(detail);
+    err.status = response.status;
+    err.isTransient = response.status >= 500 || response.status === 429;
+    throw err;
+  }
+
+  return payload;
 }
 
 async function createJob(file) {
   const formData = new FormData();
   formData.append("file", file);
   formData.append("cloudconvert_options", JSON.stringify(DEFAULT_OPTIONS));
-
-  const response = await fetch("/v1/jobs", {
+  return fetchJson("/v1/jobs", {
     method: "POST",
     body: formData,
   });
-
-  const payload = await response.json();
-  if (!response.ok) {
-    const detail = typeof payload.detail === "string" ? payload.detail : "Upload failed";
-    throw new Error(detail);
-  }
-  return payload;
 }
 
 async function fetchJob(jobId) {
-  const response = await fetch(`/v1/jobs/${jobId}`);
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.detail || "Failed to load job");
+  return fetchJson(`/v1/jobs/${jobId}`);
+}
+
+function handlePollError(error) {
+  transientPollErrors += 1;
+
+  if (transientPollErrors <= MAX_TRANSIENT_POLL_ERRORS && (error.isTransient || !navigator.onLine)) {
+    setStatus("processing", "Reconnecting...");
+    schedulePoll(Math.min(8000, POLL_INTERVAL_MS * transientPollErrors));
+    return;
   }
-  return payload;
+
+  setStatus("failed", error.message || "Polling failed");
+  setBusy(false);
+  hideDownloads();
 }
 
 async function pollJob(jobId) {
   const job = await fetchJob(jobId);
+  transientPollErrors = 0;
   showJobPanel();
   jobFile.textContent = job.input_filename || activeFileName;
 
@@ -176,6 +236,7 @@ form.addEventListener("submit", async (event) => {
   }
 
   stopPolling();
+  transientPollErrors = 0;
   setBusy(true);
   showJobPanel();
   hideDownloads();
@@ -196,12 +257,7 @@ form.addEventListener("submit", async (event) => {
 (function resumeJobIfNeeded() {
   const saved = loadActiveJob();
   if (!saved || !saved.jobId) {
-    setStatus("queued", "");
-    progressFill.style.width = "0%";
-    progressBar.setAttribute("aria-valuenow", "0");
-    jobStatus.textContent = "Idle";
-    jobMessage.textContent = "";
-    form.classList.remove("is-complete", "is-failed");
+    resetIdleState();
     return;
   }
 
@@ -211,7 +267,7 @@ form.addEventListener("submit", async (event) => {
   setStatus("processing", "Resuming");
   saveActiveJob(saved.jobId, activeFileName);
   pollJob(saved.jobId).catch((error) => {
-    setStatus("failed", error.message || "Polling failed");
+    handlePollError(error);
     setBusy(false);
   });
 })();
